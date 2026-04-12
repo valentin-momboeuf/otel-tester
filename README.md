@@ -39,7 +39,7 @@ A portable observability testing lab. Run a full OpenTelemetry stack with realis
 
 ```bash
 # Clone
-git clone https://github.com/VMMusic/otel-tester.git
+git clone https://github.com/valentin-momboeuf/otel-tester.git
 cd otel-tester
 
 # Start with debug output (all telemetry to collector stdout)
@@ -86,19 +86,28 @@ docker compose --profile generators run otelgen
 ```
 
 ### k6 Load Testing (on-demand)
-Load tests with W3C `traceparent` propagation:
+
+Load tests with W3C `traceparent` propagation. A **virtual user (VU)** is a simulated user that runs the test script in a loop concurrently with all other VUs — more VUs means more parallel load on the stack.
+
+Three scenarios are available:
+
+| Script | VUs | Duration | Pattern | Use case |
+|--------|-----|----------|---------|----------|
+| `smoke.js` | 5 | 30s | Constant | Sanity check — verify the stack works |
+| `load.js` | 20 | 5m | Constant | Sustained load — baseline performance |
+| `spike.js` | 10→100→0 | ~4m | Ramp up/down | Sudden traffic surge — resilience test |
 
 ```bash
-# Smoke test (5 VUs, 30s)
+# Smoke test: 5 concurrent users for 30s
 docker compose --profile load-test run k6
 
-# Load test (20 VUs, 5m)
+# Load test: 20 concurrent users for 5 minutes
 K6_SCRIPT=load.js docker compose --profile load-test run k6
 
-# Spike test (ramps 10→100→0)
+# Spike test: ramps from 10 to 100 VUs then back to 0
 K6_SCRIPT=spike.js docker compose --profile load-test run k6
 
-# Custom intensity
+# Custom: override any parameter at runtime
 K6_VUS=100 K6_DURATION=10m docker compose --profile load-test run k6
 ```
 
