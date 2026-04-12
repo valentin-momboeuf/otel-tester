@@ -1,0 +1,558 @@
+x-default-logging: &logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+x-otel-env: &otel-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: cumulative
+  OTEL_RESOURCE_ATTRIBUTES: service.namespace=otel-tester
+
+networks:
+  otel-tester:
+    driver: bridge
+
+volumes:
+  flog-logs:
+  valkey-data:
+  grafana-data:
+  prometheus-data:
+  kafka-data:
+  postgres-data:
+
+services:
+  # ─── OpenTelemetry Collector ───────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.121.0
+    command: ["--config", "/etc/otelcol/${COLLECTOR_CONFIG:-config.yaml}"]
+    volumes:
+      - ./collector:/etc/otelcol:ro
+      - flog-logs:/var/log/flog:ro
+    ports:
+      - "${COLLECTOR_GRPC_PORT:-4317}:4317"
+      - "${COLLECTOR_HTTP_PORT:-4318}:4318"
+      - "8889:8889"
+    environment:
+      - OTLP_ENDPOINT=${OTLP_ENDPOINT:-http://localhost:4318}
+      - OTLP_AUTH_HEADER=${OTLP_AUTH_HEADER:-}
+      - TRACES_EXPORTERS=${TRACES_EXPORTERS:-[debug]}
+      - METRICS_EXPORTERS=${METRICS_EXPORTERS:-[debug]}
+      - LOGS_EXPORTERS=${LOGS_EXPORTERS:-[debug]}
+      - DEBUG_VERBOSITY=${DEBUG_VERBOSITY:-basic}
+      - DEPLOYMENT_ENV=${DEPLOYMENT_ENV:-otel-tester}
+      - DD_API_KEY=${DD_API_KEY:-}
+      - DD_SITE=${DD_SITE:-datadoghq.com}
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── OTel Demo: Infrastructure ────────────────────────────────────
+  flagd:
+    image: ghcr.io/open-feature/flagd:v0.12.1
+    command: ["start", "--uri", "https://raw.githubusercontent.com/open-telemetry/opentelemetry-demo/main/src/flagd/demo.flagd.json"]
+    networks:
+      - otel-tester
+    logging: *logging
+
+  valkey-cart:
+    image: valkey/valkey:8-alpine
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - valkey-data:/data
+    networks:
+      - otel-tester
+    logging: *logging
+
+  kafka:
+    image: apache/kafka:4.0.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    networks:
+      - otel-tester
+    logging: *logging
+
+  astronomy-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: astronomy_user
+      POSTGRES_PASSWORD: changeit
+      POSTGRES_DB: astronomy_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astronomy_user -d astronomy_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── OTel Demo: Application Services ──────────────────────────────
+  ad:
+    image: ghcr.io/open-telemetry/demo:latest-ad
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: ad
+      AD_PORT: 9555
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+      OTEL_LOGS_EXPORTER: otlp
+    depends_on:
+      otel-collector:
+        condition: service_started
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  cart:
+    image: ghcr.io/open-telemetry/demo:latest-cart
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: cart
+      CART_PORT: 7070
+      ASPNETCORE_URLS: http://*:7070
+      VALKEY_ADDR: valkey-cart:6379
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    depends_on:
+      otel-collector:
+        condition: service_started
+      valkey-cart:
+        condition: service_healthy
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  checkout:
+    image: ghcr.io/open-telemetry/demo:latest-checkout
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: checkout
+      CHECKOUT_PORT: 5050
+      CART_ADDR: cart:7070
+      CURRENCY_ADDR: currency:7001
+      EMAIL_ADDR: http://email:6060
+      PAYMENT_ADDR: payment:50051
+      PRODUCT_CATALOG_ADDR: product-catalog:3550
+      SHIPPING_ADDR: http://shipping:50050
+      KAFKA_ADDR: kafka:9092
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    depends_on:
+      otel-collector:
+        condition: service_started
+      cart:
+        condition: service_started
+      currency:
+        condition: service_started
+      email:
+        condition: service_started
+      payment:
+        condition: service_started
+      product-catalog:
+        condition: service_started
+      shipping:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  currency:
+    image: ghcr.io/open-telemetry/demo:latest-currency
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: currency
+      CURRENCY_PORT: 7001
+      VERSION: "1.0.0"
+      IPV6_ENABLED: "false"
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  email:
+    image: ghcr.io/open-telemetry/demo:latest-email
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: email
+      EMAIL_PORT: 6060
+      APP_ENV: production
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  fraud-detection:
+    image: ghcr.io/open-telemetry/demo:latest-fraud-detection
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: fraud-detection
+      KAFKA_ADDR: kafka:9092
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    depends_on:
+      otel-collector:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  payment:
+    image: ghcr.io/open-telemetry/demo:latest-payment
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: payment
+      PAYMENT_PORT: 50051
+      IPV6_ENABLED: "false"
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    depends_on:
+      otel-collector:
+        condition: service_started
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  product-catalog:
+    image: ghcr.io/open-telemetry/demo:latest-product-catalog
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: product-catalog
+      PRODUCT_CATALOG_PORT: 3550
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+      DB_CONNECTION_STRING: postgres://astronomy_user:changeit@astronomy-db:5432/astronomy_db?sslmode=disable
+    depends_on:
+      otel-collector:
+        condition: service_started
+      astronomy-db:
+        condition: service_healthy
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  recommendation:
+    image: ghcr.io/open-telemetry/demo:latest-recommendation
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: recommendation
+      RECOMMENDATION_PORT: 9001
+      PRODUCT_CATALOG_ADDR: product-catalog:3550
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+      OTEL_PYTHON_LOG_CORRELATION: "true"
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+    depends_on:
+      otel-collector:
+        condition: service_started
+      product-catalog:
+        condition: service_started
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  shipping:
+    image: ghcr.io/open-telemetry/demo:latest-shipping
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: shipping
+      SHIPPING_PORT: 50050
+      IPV6_ENABLED: "false"
+      QUOTE_ADDR: http://quote:8090
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  quote:
+    image: ghcr.io/open-telemetry/demo:latest-quote
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: quote
+      QUOTE_PORT: 8090
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  image-provider:
+    image: ghcr.io/open-telemetry/demo:latest-imageprovider
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: image-provider
+      IMAGE_PROVIDER_PORT: 8081
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── OTel Demo: Frontend & Proxy ──────────────────────────────────
+  frontend:
+    image: ghcr.io/open-telemetry/demo:latest-frontend
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: frontend
+      PORT: 8080
+      FRONTEND_ADDR: frontend:8080
+      AD_ADDR: ad:9555
+      CART_ADDR: cart:7070
+      CHECKOUT_ADDR: checkout:5050
+      CURRENCY_ADDR: currency:7001
+      PRODUCT_CATALOG_ADDR: product-catalog:3550
+      RECOMMENDATION_ADDR: recommendation:9001
+      SHIPPING_ADDR: http://shipping:50050
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+      WEB_OTEL_SERVICE_NAME: frontend-web
+      PUBLIC_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:${COLLECTOR_HTTP_PORT:-4318}/v1/traces
+      OTEL_COLLECTOR_HOST: otel-collector
+    depends_on:
+      otel-collector:
+        condition: service_started
+      ad:
+        condition: service_started
+      cart:
+        condition: service_started
+      checkout:
+        condition: service_started
+      currency:
+        condition: service_started
+      product-catalog:
+        condition: service_started
+      recommendation:
+        condition: service_started
+      shipping:
+        condition: service_started
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  frontend-proxy:
+    image: ghcr.io/open-telemetry/demo:latest-frontendproxy
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: frontend-proxy
+      ENVOY_PORT: 8080
+      ENVOY_ADDR: 0.0.0.0
+      ENVOY_ADMIN_PORT: 9901
+      FRONTEND_PORT: 8080
+      FRONTEND_HOST: frontend
+      LOCUST_WEB_PORT: 8089
+      LOCUST_WEB_HOST: load-generator
+      GRAFANA_SERVICE_PORT: 3000
+      GRAFANA_SERVICE_HOST: grafana
+      JAEGER_SERVICE_PORT: 16686
+      JAEGER_SERVICE_HOST: jaeger
+      OTEL_COLLECTOR_HOST: otel-collector
+      OTEL_COLLECTOR_PORT_GRPC: 4317
+      OTEL_COLLECTOR_PORT_HTTP: 4318
+      IMAGE_PROVIDER_HOST: image-provider
+      IMAGE_PROVIDER_PORT: 8081
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+      FLAGD_UI_HOST: flagd
+      FLAGD_UI_PORT: 8016
+    ports:
+      - "${ENVOY_PORT:-8080}:8080"
+    depends_on:
+      otel-collector:
+        condition: service_started
+      frontend:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  load-generator:
+    image: ghcr.io/open-telemetry/demo:latest-loadgenerator
+    environment:
+      <<: *otel-env
+      OTEL_SERVICE_NAME: load-generator
+      LOCUST_WEB_PORT: 8089
+      LOCUST_USERS: 10
+      LOCUST_HOST: http://frontend-proxy:8080
+      LOCUST_HEADLESS: "false"
+      LOCUST_AUTOSTART: "true"
+      LOCUST_WEB_HOST: 0.0.0.0
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+      FLAGD_HOST: flagd
+      FLAGD_PORT: 8013
+    ports:
+      - "8089:8089"
+    depends_on:
+      frontend-proxy:
+        condition: service_started
+      flagd:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── Signal Generators ─────────────────────────────────────────────
+  otelgen:
+    image: ghcr.io/krzko/otelgen:v0.5.1
+    command:
+      - traces
+      - multi
+      - --otel-exporter-otlp-endpoint
+      - otel-collector:4317
+      - --insecure
+      - --duration
+      - "60"
+    profiles:
+      - generators
+    depends_on:
+      otel-collector:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  flog:
+    image: mingrammer/flog:0.4.3
+    command: ["-f", "apache_combined", "-d", "5s", "-l", "-o", "/var/log/flog/access.log"]
+    volumes:
+      - flog-logs:/var/log/flog
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── k6 Load Testing ──────────────────────────────────────────────
+  k6:
+    image: grafana/k6:0.56.0
+    command: ["run", "--out", "experimental-opentelemetry", "/scripts/${K6_SCRIPT:-smoke.js}"]
+    environment:
+      K6_OTEL_GRPC_EXPORTER_INSECURE: "true"
+      K6_OTEL_GRPC_EXPORTER_ENDPOINT: otel-collector:4317
+      K6_VUS: ${K6_VUS:-}
+      K6_DURATION: ${K6_DURATION:-}
+    volumes:
+      - ./k6/scripts:/scripts:ro
+    profiles:
+      - load-test
+    depends_on:
+      otel-collector:
+        condition: service_started
+      frontend-proxy:
+        condition: service_started
+    networks:
+      - otel-tester
+    logging: *logging
+
+  # ─── Local Backend (Jaeger + Prometheus + Grafana) ─────────────────
+  jaeger:
+    image: jaegertracing/jaeger:2.6.0
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+    profiles:
+      - local
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16687"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - otel-tester
+    logging: *logging
+
+  prometheus:
+    image: prom/prometheus:v3.4.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--web.enable-lifecycle"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    profiles:
+      - local
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - otel-tester
+    logging: *logging
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    profiles:
+      - local
+    depends_on:
+      jaeger:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - otel-tester
+    logging: *logging
